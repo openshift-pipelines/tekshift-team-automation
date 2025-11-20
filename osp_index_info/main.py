@@ -1,52 +1,55 @@
 #!/usr/bin/env python3
 
+import argparse
 import re
 import json
 import subprocess
-import sys
+import os
 import typing as t
 import tempfile
 
 IMAGE_REPO_TO_GIT_REPO = {
-	"pipelines-cache-rhel9": "openshift-pipelines/tekton-caches",
-	"pipelines-chains-controller-rhel9": "tektoncd/chains",
-	"pipelines-cli-tkn-rhel9": "tektoncd/cli",
-	"pipelines-console-plugin-rhel9": "openshift-pipelines/console-plugin",
-	"pipelines-controller-rhel9": "tektoncd/pipeline",
-	"pipelines-entrypoint-rhel9": "tektoncd/pipeline",
-	"pipelines-events-rhel9": "tektoncd/pipeline",
-	"pipelines-git-init-rhel9": "openshift-pipelines/ecosystem-images",
-	"pipelines-hub-api-rhel9": "tektoncd/hub",
-	"pipelines-hub-db-migration-rhel9": "tektoncd/hub",
-	"pipelines-hub-ui-rhel9": "tektoncd/hub",
-	"pipelines-manual-approval-gate-controller-rhel9": "openshift-pipelines/manual-approval-gate",
-	"pipelines-manual-approval-gate-webhook-rhel9": "openshift-pipelines/manual-approval-gate",
-	"pipelines-nop-rhel9": "tektoncd/pipeline",
-	"pipelines-opc-rhel9": "",
-	"pipelines-operator-bundle": "tektoncd/operator",
-	"pipelines-operator-proxy-rhel9": "tektoncd/operator",
-	"pipelines-operator-webhook-rhel9": "tektoncd/operator",
-	"pipelines-pipelines-as-code-cli-rhel9": "openshift-pipelines/pipelines-as-code",
-	"pipelines-pipelines-as-code-controller-rhel9": "openshift-pipelines/pipelines-as-code",
-	"pipelines-pipelines-as-code-watcher-rhel9": "openshift-pipelines/pipelines-as-code",
-	"pipelines-pipelines-as-code-webhook-rhel9": "openshift-pipelines/pipelines-as-code",
-	"pipelines-pruner-controller-rhel9": "openshift-pipelines/tektoncd-pruner",
-	"pipelines-resolvers-rhel9": "tektoncd/pipeline",
-	"pipelines-results-api-rhel9": "tektoncd/results",
-	"pipelines-results-retention-policy-agent-rhel9": "tektoncd/results",
-	"pipelines-results-watcher-rhel9": "tektoncd/results",
-	"pipelines-rhel9-operator": "openshift-pipelines/operator",
-	"pipelines-sidecarlogresults-rhel9": "tektoncd/pipeline",
-	"pipelines-triggers-controller-rhel9": "tektoncd/triggers",
-	"pipelines-triggers-core-interceptors-rhel9": "tektoncd/triggers",
-	"pipelines-triggers-eventlistenersink-rhel9": "tektoncd/triggers",
-	"pipelines-triggers-webhook-rhel9": "tektoncd/triggers",
-	"pipelines-webhook-rhel9": "tektoncd/pipeline",
-	"pipelines-workingdirinit-rhel9": "tektoncd/pipeline",
+    "pipelines-cache-rhel9": "openshift-pipelines/tekton-caches",
+    "pipelines-chains-controller-rhel9": "tektoncd/chains",
+    "pipelines-cli-tkn-rhel9": "tektoncd/cli",
+    "pipelines-console-plugin-rhel9": "openshift-pipelines/console-plugin",
+    "pipelines-controller-rhel9": "tektoncd/pipeline",
+    "pipelines-entrypoint-rhel9": "tektoncd/pipeline",
+    "pipelines-events-rhel9": "tektoncd/pipeline",
+    "pipelines-git-init-rhel9": "openshift-pipelines/ecosystem-images",
+    "pipelines-hub-api-rhel9": "tektoncd/hub",
+    "pipelines-hub-db-migration-rhel9": "tektoncd/hub",
+    "pipelines-hub-ui-rhel9": "tektoncd/hub",
+    "pipelines-manual-approval-gate-controller-rhel9": "openshift-pipelines/manual-approval-gate",
+    "pipelines-manual-approval-gate-webhook-rhel9": "openshift-pipelines/manual-approval-gate",
+    "pipelines-nop-rhel9": "tektoncd/pipeline",
+    "pipelines-opc-rhel9": "",
+    "pipelines-operator-bundle": "tektoncd/operator",
+    "pipelines-operator-proxy-rhel9": "tektoncd/operator",
+    "pipelines-operator-webhook-rhel9": "tektoncd/operator",
+    "pipelines-pipelines-as-code-cli-rhel9": "openshift-pipelines/pipelines-as-code",
+    "pipelines-pipelines-as-code-controller-rhel9": "openshift-pipelines/pipelines-as-code",
+    "pipelines-pipelines-as-code-watcher-rhel9": "openshift-pipelines/pipelines-as-code",
+    "pipelines-pipelines-as-code-webhook-rhel9": "openshift-pipelines/pipelines-as-code",
+    "pipelines-pruner-controller-rhel9": "openshift-pipelines/tektoncd-pruner",
+    "pipelines-resolvers-rhel9": "tektoncd/pipeline",
+    "pipelines-results-api-rhel9": "tektoncd/results",
+    "pipelines-results-retention-policy-agent-rhel9": "tektoncd/results",
+    "pipelines-results-watcher-rhel9": "tektoncd/results",
+    "pipelines-rhel9-operator": "openshift-pipelines/operator",
+    "pipelines-sidecarlogresults-rhel9": "tektoncd/pipeline",
+    "pipelines-triggers-controller-rhel9": "tektoncd/triggers",
+    "pipelines-triggers-core-interceptors-rhel9": "tektoncd/triggers",
+    "pipelines-triggers-eventlistenersink-rhel9": "tektoncd/triggers",
+    "pipelines-triggers-webhook-rhel9": "tektoncd/triggers",
+    "pipelines-webhook-rhel9": "tektoncd/pipeline",
+    "pipelines-workingdirinit-rhel9": "tektoncd/pipeline",
 }
+
 
 def stderr(msg: str):
     print(msg, file=os.stderr)
+
 
 class Image:
     image_ref: str
@@ -58,10 +61,17 @@ class Image:
     _container_id: str | None = None
 
     def __init__(self, image_ref: str):
+        # TODO: add better handling for tags, tag+digest, and invalid image formats
         self.image_ref = image_ref
         image_repo_full = image_ref.split("@")[0]
         self.image_repo = image_repo_full.split("/")[-1]
-        self.image_digest = image_ref.split(":")[1]
+
+        colon_parts = image_ref.split(":")
+        if len(colon_parts) > 1:
+            self.image_digest = colon_parts[1]
+        else:
+            self.image_digest = None
+
         self.code_repo = IMAGE_REPO_TO_GIT_REPO.get(self.image_repo)
 
     def is_pipelines_maintained(self) -> bool:
@@ -105,15 +115,19 @@ class Image:
 
         return self._upstream_commit
 
-    def as_dict(self) -> dict:
+    def as_dict(self, show_info: bool) -> dict:
         d = {"image": self.image_ref}
-        if self.downstream_commit():
-            d["downstream_commit"] = self.downstream_commit()
-        if self.upstream_commit():
-            d["upstream_commit"] = self.upstream_commit()
-            if self.code_repo:
-                d["git_link"] = f"github.com/{self.code_repo}/commit/{self.upstream_commit()}"
+        if show_info:
+            if self.downstream_commit():
+                d["downstream_commit"] = self.downstream_commit()
+            if self.upstream_commit():
+                d["upstream_commit"] = self.upstream_commit()
+                if self.code_repo:
+                    d["git_link"] = f"github.com/{self.code_repo}/commit/{self.upstream_commit()}"
         return d
+
+    def exists(self) -> bool:
+        cmd = subprocess.run(["podman", "inspect", self._get_container_id()], capture_output=True, text=True, check=True)
 
     def clean(self):
         if self._container_id is not None:
@@ -134,18 +148,23 @@ class Bundle:
         properties = self.data.get("properties", [])
         package_properties = [p for p in properties if p.get("type") == "olm.package" and p.get("value", {}).get("packageName") == "openshift-pipelines-operator-rh"]
         if len(package_properties) != 1:
-            return ""
+            return "No version found"
         return package_properties[0].get("value", {}).get("version", "")
 
-    def as_dict(self) -> dict[str, dict[t.Any, t.Any]]:
+    def as_dict(self, show_info: bool = False) -> dict[str, dict[t.Any, t.Any]]:
         return {
             "version": self.version(),
-            "images": {i.image_repo: i.as_dict() for i in self.images},
+            "images": {i.image_repo: i.as_dict(show_info=show_info) for i in self.images},
         }
 
     def clean(self):
         for image in self.images:
             image.clean()
+
+    def validate_images(self):
+        for image in self.images:
+            image_exists = image.exists
+
 
 class Catalog:
     def __init__(self, image: str):
@@ -160,9 +179,11 @@ class Catalog:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"error creating container for catalog '{self.image}':\n---\n{e.output}\n---\n{e.stderr}") from e
 
+        self.container_id = str(container_id.strip())
+
         with tempfile.TemporaryDirectory() as tmpdir:
             outfile = f"{tmpdir}/catalog.json"
-            subprocess.run(["podman", "cp", f"{str(container_id.strip())}:/configs/openshift-pipelines-operator-rh/catalog.json", outfile], check=True)
+            subprocess.run(["podman", "cp", f"{self.container_id}:/configs/openshift-pipelines-operator-rh/catalog.json", outfile], check=True)
             with open(outfile) as catalog:
                 catalog_json = catalog.read()
                 objects = re.findall(r'\n(\{.*?\n\})', catalog_json, re.DOTALL)
@@ -186,25 +207,47 @@ class Catalog:
 
     def clean(self):
         if self.container_id is not None:
-            subprocess.run(["podman", "container", "rm", self.container_id], text=True, check=True)
+            subprocess.run(["podman", "container", "rm", self.container_id], capture_output=True, text=True, check=True)
         for entry in self.bundles():
             entry.clean()
 
+    def get_bundle(self, name: str) -> Bundle:
+        matching_bundles = list(b for b in self.bundles() if b.name.startswith(name))
+        if len(matching_bundles) == 0:
+            raise Exception(f"No bundle found with name {name}")
+        if len(matching_bundles) > 1:
+            raise Exception("Cannot select Bundle from ambiguous name {name}. Found {len(matching_bundles} matches")
+        return matching_bundles[0]
+
 
 def __main__():
+    parser = argparse.ArgumentParser("Openshift Pipelines Index inspector")
+    parser.add_argument("command", choices=["full-info", "list-images", "build-version", "validate-images"])
+    parser.add_argument("image")
+    parser.add_argument("-c", "--channel", default="v5.0.5")
+
+    args = parser.parse_args()
+
     catalog = None
     try:
-        if len(sys.argv) == 1:
-            stderr("No index image provided")
+        catalog = Catalog(args.image)
+        bundle = catalog.get_bundle(f"openshift-pipelines-operator-rh.{args.channel}")
 
-        catalog_image = sys.argv[1]
-        catalog = Catalog(catalog_image)
-        bundles = catalog.bundles()
-        if nightly_bundle := list(b.as_dict() for b in bundles if b.name.startswith("openshift-pipelines-operator-rh.v5.0.5")):
-            print(json.dumps(nightly_bundle[0]))
+        if args.command == "full-info":
+            print(json.dumps(bundle.as_dict(show_info=True)))
+        elif args.command == "list-images":
+            print(json.dumps(bundle.as_dict(show_info=False)))
+        elif args.command == "build-version":
+            print(f"Name: {bundle.name}\nVersion: {bundle.version()}")
+        elif args.command == "validate-images":
+            print(bundle.validate_images(channel=args.channel))
+        else:
+            print("Unknown command \"{args.command}\"")
+            print(parser.format_help())
     finally:
-        if catalog != None:
+        if catalog is not None:
             catalog.clean()
+
 
 if __name__ == "__main__":
     __main__()
