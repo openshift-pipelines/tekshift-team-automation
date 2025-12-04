@@ -16,7 +16,7 @@ IMAGE_REPO_TO_GIT_REPO = {
     "pipelines-controller-rhel9": "tektoncd/pipeline",
     "pipelines-entrypoint-rhel9": "tektoncd/pipeline",
     "pipelines-events-rhel9": "tektoncd/pipeline",
-    "pipelines-git-init-rhel9": "openshift-pipelines/ecosystem-images",
+    "pipelines-git-init-rhel9": "openshift-pipelines/tektoncd-git-clone",
     "pipelines-hub-api-rhel9": "tektoncd/hub",
     "pipelines-hub-db-migration-rhel9": "tektoncd/hub",
     "pipelines-hub-ui-rhel9": "tektoncd/hub",
