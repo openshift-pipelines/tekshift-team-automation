@@ -11,6 +11,7 @@ import typing as t
 import tempfile
 from functools import cache, cached_property
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 # TODO: This should be coming from the upstream-vcs-location label, if present
 IMAGE_REPO_TO_GIT_REPO = {
@@ -36,12 +37,12 @@ IMAGE_REPO_TO_GIT_REPO = {
     "pipelines-pipelines-as-code-controller-rhel9": "openshift-pipelines/pipelines-as-code",
     "pipelines-pipelines-as-code-watcher-rhel9": "openshift-pipelines/pipelines-as-code",
     "pipelines-pipelines-as-code-webhook-rhel9": "openshift-pipelines/pipelines-as-code",
-    "pipelines-pruner-controller-rhel9": "openshift-pipelines/tektoncd-pruner",
+    "pipelines-pruner-controller-rhel9": "tektoncd/pruner",
     "pipelines-resolvers-rhel9": "tektoncd/pipeline",
     "pipelines-results-api-rhel9": "tektoncd/results",
     "pipelines-results-retention-policy-agent-rhel9": "tektoncd/results",
     "pipelines-results-watcher-rhel9": "tektoncd/results",
-    "pipelines-rhel9-operator": "openshift-pipelines/operator",
+    "pipelines-rhel9-operator": "tektoncd/operator",
     "pipelines-sidecarlogresults-rhel9": "tektoncd/pipeline",
     "pipelines-triggers-controller-rhel9": "tektoncd/triggers",
     "pipelines-triggers-core-interceptors-rhel9": "tektoncd/triggers",
@@ -90,6 +91,7 @@ class Image:
         if self.image_ref in pulled_images:
             logger.warning(f"image {self.image_ref} pulled more than once")
         try:
+            logger.debug(f"pulling image {self.image_ref}")
             subprocess.run(["podman", "exists", self.image_ref], capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError:
             subprocess.run(["podman", "pull", "-q", self.image_ref], capture_output=True, text=True, check=True)
@@ -151,6 +153,7 @@ class Image:
         if self.code_repo and self.upstream_commit():
             return f"github.com/{self.code_repo}/commit/{self.upstream_commit()}"
 
+    @cache
     def exists(self) -> bool:
         try:
             self._pull()
@@ -193,9 +196,9 @@ class Bundle:
         for image in self.images:
             image.clean()
 
-    def validate_images(self):
-        for image in self.images:
-            image_exists = image.exists
+    def validate_images(self) -> str:
+        invalid_images = [image for image in self.images if not image.exists()]
+        return "Missing images:\n\t" + "\n\t".join(i.image_ref for i in invalid_images)
 
 
 class Catalog:
@@ -271,6 +274,32 @@ class RepoChange:
     def compare_url(self) -> str:
         return f"https://api.github.com/repos/{self.git_repo}/compare/{self.old_revision}...{self.new_revision}"
 
+    def warnings(self) -> list[str]:
+        warnings = []
+
+        if self.git_repo and self.old_revision and self.new_revision:
+            def commit_date(sha: str) -> str:
+                url = f"https://api.github.com/repos/{self.git_repo}/commits/{sha}"
+                logger.debug(f"Fetching commit data from {url}")
+                try:
+                    with urlopen(url) as r:
+                        resp = json.load(r)
+                        return resp.get("commit", {}).get("comitter", {}).get("date", "")
+                except HTTPError:
+                    warnings.append(f"unable to find revision {sha[:8]} in repo {self.git_repo}")
+                return ""
+
+            old_date = commit_date(self.old_revision)
+            new_date = commit_date(self.new_revision)
+            if old_date and new_date and new_date <= old_date:
+                warnings.append(f"new revision {self.new_revision[:8]} ({new_date}) created before old revision {self.old_revision[:8]} ({old_date})")
+        elif self.git_repo:
+            missing_revision = "old"
+            if self.old_revision:
+                missing_revision = "new"
+            warnings.append(f"no {missing_revision} revision to compare")
+        return warnings
+
     @cache
     def _comparison(self) -> dict[str, object]:
         with urlopen(self.compare_url()) as r:
@@ -324,29 +353,66 @@ def compare(args):
     old_bundle = old_catalog.get_bundle(bundle_name)
     new_bundle: Bundle = new_catalog.get_bundle(bundle_name)
 
-    print(f"Comparing {old_catalog.image} to {new_catalog.image} for {args.channel}\n---")
-
+    output = {
+        "old_catalog": old_catalog.image,
+        "new_catalog": new_catalog.image,
+        "channel": args.channel,
+        "changes": {}
+    }
     for change in get_changes(old_bundle, new_bundle):
-        print(f"{change.git_repo}:")
+        data = None
         match args.action:
             case "show-heads":
-                print(f"\told commit: {change.old_revision}\n\tnew commit: {change.new_revision}")
+                data = {"old_sha": change.old_revision, "new_sha": change.new_revision}
             case "show-compare-urls":
-                print("\t", change.compare_url())
+                data = {"change_url": change.compare_url()}
             case "show-all-shas":
                 try:
-                    for commit in change.commits():
-                        print("\t" + commit.get("sha"))
+                    data = {"commits": [commit.get("sha") for commit in change.commits() if commit.get("sha")]}
                 except Exception as e:
                     logger.exception(f"Could not get SHAs for image {change.image_name}: {e}")
             case "show-all-commits":
+                data = {}
                 try:
-                    for commit in change.commits():
-                        message = commit.get('commit', {}).get('message', "")
-                        message = message.replace("\n", "\n\t\t")
-                        print(f"\n\t{commit.get('sha')}\n\t\t {message}")
+                    data = {"commits": [{"sha": commit.get("sha"), "message": commit.get('commit', {}).get("message")} for commit in change.commits()]}
                 except Exception as e:
                     logger.exception(f"Could not get SHAs for image {change.image_name}: {e}")
+        data["image"] = change.image_name
+        data["warning"] = change.warnings()
+
+        output["changes"][change.git_repo] = data
+
+    format = args.output
+
+    if format == "text":
+        print(f"Comparing {output['old_catalog']} to {output['new_catalog']} for {output['channel']}\n---")
+
+        for repo, change in output["changes"].items():
+            print(f"{repo}:")
+            match args.action:
+                case "show-heads":
+                    print(f"\told commit: {change['old_sha']}\n\tnew commit: {change['new_sha']}")
+                case "show-compare-urls":
+                    print("\t", change['change_url'])
+                case "show-all-shas":
+                    try:
+                        for sha in change['commits']:
+                            print("\t" + sha)
+                    except Exception as e:
+                        logger.exception(f"Could not get SHAs for image {change['image']}: {e}")
+                case "show-all-commits":
+                    try:
+                        for commit in change['commits']:
+                            message = commit['message'].replace("\n", "\n\t\t")
+                            print(f"\n\t{commit.get('sha')}\n\t\t {message}")
+                    except Exception as e:
+                        logger.exception(f"Could not get SHAs for image {change['image']}: {e}")
+            if warnings := data["warning"]:
+                print("\tWarnings:")
+                for w in warnings:
+                    print("\t\t" + w)
+    elif format == "json":
+        print(json.dumps(output, indent=" "))
 
 
 def __main__():
@@ -368,6 +434,7 @@ def __main__():
     compare_parser.add_argument("action", default="show-heads", choices=["show-heads", "show-compare-urls", "show-all-shas", "show-all-commits"])
     compare_parser.set_defaults(func=compare)
     compare_parser.add_argument("-c", "--channel", default="v5.0.5")
+    compare_parser.add_argument("-o", "--output", default="text", choices=["json", "text"])
 
     args = parser.parse_args()
 
