@@ -424,8 +424,13 @@ def __main__():
     parser.set_defaults(func=None)
     subparses = parser.add_subparsers()
 
-    for cmd in ["full-info", "list-images", "build-version", "validate-images"]:
-        subparser = subparses.add_parser(cmd)
+    for (cmd, help) in [
+        ("build-version", "output the index build version and exit"),
+        ("full-info", "output image, upstream and downstream source information, and link to upstream source in JSON format"),
+        ("list-images", "output list of all images included in the index, by component"),
+        ("validate-images","validate that all images linked in the index exist"),
+    ]:
+        subparser = subparses.add_parser(cmd, help=help)
         subparser.set_defaults(command=cmd)
         subparser.add_argument("image")
         subparser.add_argument("-c", "--channel", default="v5.0.5")
