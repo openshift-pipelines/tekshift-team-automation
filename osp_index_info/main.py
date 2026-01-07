@@ -10,7 +10,7 @@ import sys
 import typing as t
 import tempfile
 from functools import cache, cached_property
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 from urllib.error import HTTPError
 
 # TODO: This should be coming from the upstream-vcs-location label, if present
@@ -197,8 +197,9 @@ class Bundle:
             image.clean()
 
     def validate_images(self) -> str:
-        invalid_images = [image for image in self.images if not image.exists()]
-        return "Missing images:\n\t" + "\n\t".join(i.image_ref for i in invalid_images)
+        if invalid_images := [image for image in self.images if not image.exists()]:
+            return "Missing images:\n\t" + "\n\t".join(i.image_ref for i in invalid_images)
+        return "All images reachable"
 
 
 class Catalog:
@@ -284,14 +285,14 @@ class RepoChange:
                 try:
                     with urlopen(url) as r:
                         resp = json.load(r)
-                        return resp.get("commit", {}).get("comitter", {}).get("date", "")
+                        return resp.get("commit", {}).get("committer", {}).get("date", "")
                 except HTTPError:
                     warnings.append(f"unable to find revision {sha[:8]} in repo {self.git_repo}")
                 return ""
 
             old_date = commit_date(self.old_revision)
             new_date = commit_date(self.new_revision)
-            if old_date and new_date and new_date <= old_date:
+            if old_date and new_date and new_date <= old_date and self.old_revision != self.new_revision:
                 warnings.append(f"new revision {self.new_revision[:8]} ({new_date}) created before old revision {self.old_revision[:8]} ({old_date})")
         elif self.git_repo:
             missing_revision = "old"
@@ -378,7 +379,8 @@ def compare(args):
                 except Exception as e:
                     logger.exception(f"Could not get SHAs for image {change.image_name}: {e}")
         data["image"] = change.image_name
-        data["warning"] = change.warnings()
+        if warnings := change.warnings():
+            data["warning"] = warnings
 
         output["changes"][change.git_repo] = data
 
@@ -407,7 +409,7 @@ def compare(args):
                             print(f"\n\t{commit.get('sha')}\n\t\t {message}")
                     except Exception as e:
                         logger.exception(f"Could not get SHAs for image {change['image']}: {e}")
-            if warnings := data["warning"]:
+            if warnings := change.get("warning"):
                 print("\tWarnings:")
                 for w in warnings:
                     print("\t\t" + w)
