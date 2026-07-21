@@ -17,13 +17,15 @@ RINGS_FILE="${SCRIPT_DIR}/ring-mappings.yaml"
 OC_TIMEOUT=10  # seconds for oc commands before timing out
 
 # ── Colors ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-DIM='\033[2m'
-RESET='\033[0m'
+# $'...' ensures \033 is stored as the actual ESC byte (0x1B) so color codes
+# render correctly both in printf format strings and %s/%b arguments.
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
 
 # Disable colors when stdout is not a terminal
 if [[ ! -t 1 ]]; then
@@ -38,6 +40,10 @@ ARG_SUMMARY=false
 ARG_VERIFY=false
 ARG_REPO_PATH=""
 ARG_JSON=false
+ARG_WATCH=false
+ARG_WAIT=false
+ARG_INTERVAL=5      # seconds between --watch / --wait iterations
+ARG_TIMEOUT=0       # --wait only: 0 = no timeout, else max seconds to wait
 
 # Per-target context used by run_oc during multi-cluster iteration.
 # Set before each cluster's checks; takes precedence over ARG_CONTEXT.
@@ -60,6 +66,10 @@ Options:
                         context resolution for all targets
   --summary             One-line-per-cluster table for quick comparison
   --verify              Run extended post-upgrade checks (pruner, marketplace)
+  --watch               Re-run checks until Ctrl-C (mutually exclusive with --wait)
+  --wait                Re-run checks until all pass, then exit
+  --interval <sec>      Seconds between --watch/--wait iterations (default: 5)
+  --timeout <sec>       Max seconds for --wait before failing (default: no limit)
   --json                Output results as JSON (implies no colors)
   --repo-path <path>    Path to infra-deployments repo (overrides auto-detect)
   --version             Show version information
@@ -73,6 +83,9 @@ Examples:
   $(basename "$0") --ring all --json        # machine-readable output
   $(basename "$0") --cluster stone-prod-p02 # specific cluster
   $(basename "$0") --verify                 # full post-upgrade checks
+  $(basename "$0") --verify --wait          # retry until post-upgrade checks pass
+  $(basename "$0") --verify --watch         # refresh checks until Ctrl-C
+  $(basename "$0") --wait --interval 10 --timeout 600
   $(basename "$0") --context admin-ctx      # use specific kubeconfig context
 
 Multi-cluster context resolution:
@@ -133,6 +146,32 @@ parse_args() {
         ARG_VERIFY=true
         shift
         ;;
+      --watch)
+        ARG_WATCH=true
+        shift
+        ;;
+      --wait)
+        ARG_WAIT=true
+        shift
+        ;;
+      --interval)
+        ARG_INTERVAL="${2:-}"
+        [[ -z "$ARG_INTERVAL" ]] && { echo "Error: --interval requires a value in seconds" >&2; exit 1; }
+        if ! [[ "$ARG_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+          echo "Error: --interval must be a positive integer" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      --timeout)
+        ARG_TIMEOUT="${2:-}"
+        [[ -z "$ARG_TIMEOUT" ]] && { echo "Error: --timeout requires a value in seconds" >&2; exit 1; }
+        if ! [[ "$ARG_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+          echo "Error: --timeout must be a positive integer" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
       --json)
         ARG_JSON=true
         RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' RESET=''
@@ -158,6 +197,19 @@ parse_args() {
         ;;
     esac
   done
+
+  if [[ "$ARG_WATCH" == true && "$ARG_WAIT" == true ]]; then
+    echo "Error: --watch and --wait are mutually exclusive" >&2
+    exit 1
+  fi
+  if [[ "$ARG_WATCH" == true && "$ARG_JSON" == true ]]; then
+    echo "Error: --watch cannot be combined with --json" >&2
+    exit 1
+  fi
+  if [[ "$ARG_TIMEOUT" -gt 0 && "$ARG_WAIT" != true ]]; then
+    echo "Error: --timeout requires --wait" >&2
+    exit 1
+  fi
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -781,32 +833,30 @@ emit_json() {
 }
 
 # ── Connectivity Check ──────────────────────────────────────────────────────
+# Uses 'oc whoami' instead of 'oc cluster-info' because the latter requires
+# permission to list services in kube-system, which non-admin users lack.
 check_connectivity() {
-  if ! run_oc cluster-info > /dev/null 2>&1; then
+  if ! run_oc whoami > /dev/null 2>&1; then
     return 1
   fi
   return 0
 }
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-main() {
-  parse_args "$@"
-  resolve_rings_file
+# Clear per-run state so --watch / --wait iterations don't leak prior results.
+reset_run_state() {
+  OBSERVED_CSV=()
+  OBSERVED_CATSRC_SHA=()
+  OBSERVED_PAC_SHA=()
+  SUMMARY_DATA=()
+  JSON_RESULTS=()
+}
 
-  # Dependency check
-  local required_cmds=(oc yq)
-  [[ "$ARG_JSON" == true ]] && required_cmds+=(jq)
-  for cmd in "${required_cmds[@]}"; do
-    if ! command -v "$cmd" &>/dev/null; then
-      echo "Error: '$cmd' is required but not found in PATH" >&2
-      exit 1
-    fi
-  done
-
-  resolve_targets
-
+# Run one full pass over TARGETS. Prints results; returns 0 if all checks passed.
+execute_checks() {
   local overall_exit=0
   local cluster_count=${#TARGETS[@]}
+
+  reset_run_state
 
   if [[ "$ARG_JSON" == true ]]; then
     # ── JSON mode: run detailed checks, collect data, emit JSON on stdout ──
@@ -938,6 +988,59 @@ main() {
   fi
 
   return $overall_exit
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+  resolve_rings_file
+
+  # Dependency check
+  local required_cmds=(oc yq)
+  [[ "$ARG_JSON" == true ]] && required_cmds+=(jq)
+  for cmd in "${required_cmds[@]}"; do
+    if ! command -v "$cmd" &>/dev/null; then
+      echo "Error: '$cmd' is required but not found in PATH" >&2
+      exit 1
+    fi
+  done
+
+  resolve_targets
+
+  if [[ "$ARG_WATCH" == true ]]; then
+    info "Watching every ${ARG_INTERVAL}s — Ctrl-C to stop"
+    while true; do
+      clear 2>/dev/null || printf '\033[2J\033[H'
+      printf "${DIM}%s${RESET}\n" "$(date -Iseconds 2>/dev/null || date)"
+      execute_checks || true
+      sleep "$ARG_INTERVAL"
+    done
+  fi
+
+  if [[ "$ARG_WAIT" == true ]]; then
+    local start=$SECONDS
+    local attempt=1
+    info "Waiting for checks to pass (interval=${ARG_INTERVAL}s${ARG_TIMEOUT:+, timeout=${ARG_TIMEOUT}s})"
+    while true; do
+      printf "${DIM}── attempt %d (%s) ──${RESET}\n" "$attempt" "$(date -Iseconds 2>/dev/null || date)"
+      if execute_checks; then
+        info "${GREEN}Checks passed — done waiting${RESET}"
+        return 0
+      fi
+
+      if [[ "$ARG_TIMEOUT" -gt 0 && $((SECONDS - start)) -ge "$ARG_TIMEOUT" ]]; then
+        echo "Error: timed out after ${ARG_TIMEOUT}s waiting for checks to pass" >&2
+        return 1
+      fi
+
+      info "Retrying in ${ARG_INTERVAL}s…"
+      sleep "$ARG_INTERVAL"
+      attempt=$((attempt + 1))
+      echo ""
+    done
+  fi
+
+  execute_checks
 }
 
 main "$@"
