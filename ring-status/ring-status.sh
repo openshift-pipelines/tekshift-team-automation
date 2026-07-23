@@ -45,6 +45,7 @@ ARG_WAIT=false
 ARG_INTERVAL=5      # seconds between --watch / --wait iterations
 ARG_TIMEOUT=0       # --wait only: 0 = no timeout, else max seconds to wait
 ARG_DIAG_DIR=""     # custom directory for diagnostic logs
+ARG_PR_URL=""       # --pr-overwatch: GitHub PR URL to watch until merge
 
 # ── Diagnostic Log State ──────────────────────────────────────────────────
 DIAG_LOG=""                                     # path to current session log
@@ -72,10 +73,15 @@ Options:
                         context resolution for all targets
   --summary             One-line-per-cluster table for quick comparison
   --verify              Run extended post-upgrade checks (pruner, marketplace)
+  --pr-overwatch <url>  Watch a GitHub PR until merge, then verify cluster health.
+                        Polls the PR every 30s; once merged, runs health checks
+                        in --wait mode until all pass. Combinable with --ring,
+                        --cluster, --verify, --interval, --timeout.
   --watch               Re-run checks until Ctrl-C (mutually exclusive with --wait)
   --wait                Re-run checks until all pass, then exit
   --interval <sec>      Seconds between --watch/--wait iterations (default: 5)
-  --timeout <sec>       Max seconds for --wait before failing (default: no limit)
+  --timeout <sec>       Max seconds for --wait/--pr-overwatch health checks
+                        before failing (default: no limit)
   --json                Output results as JSON (implies no colors)
   --diag-dir <path>     Directory for diagnostic logs (default: \$TMPDIR/ring-status-diag)
   --repo-path <path>    Path to infra-deployments repo (overrides auto-detect)
@@ -95,6 +101,9 @@ Examples:
   $(basename "$0") --wait --interval 10 --timeout 600
   $(basename "$0") --context admin-ctx      # use specific kubeconfig context
   $(basename "$0") --wait --diag-dir ./logs # diagnostic logs written to ./logs/
+  $(basename "$0") --pr-overwatch https://github.com/org/repo/pull/1234
+  $(basename "$0") --pr-overwatch https://github.com/org/repo/pull/1234 --ring 1
+  $(basename "$0") --pr-overwatch https://github.com/org/repo/pull/1234 --timeout 900
 
 Multi-cluster context resolution:
   When --ring is used without --context, the script attempts to use each
@@ -112,8 +121,19 @@ Health checks performed:
   4. Pod health in openshift-pipelines — total + unhealthy count
   5. tekton-events-controller — running status + memory limit
   6. Pipelines as Code controller — image SHA
-  7. tekton-resource-pruner CronJob — last job status  (--verify only)
-  8. Marketplace pods health                            (--verify only)
+  7. Component health — per-workload readiness for all expected
+     deployments and statefulsets (PaC components discovered by prefix)
+  8. tekton-resource-pruner CronJob — last job status  (--verify only)
+  9. Marketplace pods health                            (--verify only)
+
+PR Overwatch (--pr-overwatch):
+  Two-phase automated workflow:
+    Phase 1 — polls the GitHub PR every 30s until it is merged (or closed).
+    Phase 2 — runs health checks in --wait mode until all pass.
+  Designed to be started and left running in the background so you get
+  automatic post-merge verification. Combine with --ring or --cluster to
+  target specific clusters, and --timeout to cap the health-check phase.
+  Tip: background with  nohup ./ring-status.sh --pr-overwatch <url> &
 
 Diagnostic logging:
   When any check fails, the script automatically captures detailed diagnostic
@@ -129,7 +149,8 @@ Cross-cluster comparison (when checking multiple clusters):
 Requires:
   oc    OpenShift CLI
   yq    Mike Farah's yq v4+ (https://github.com/mikefarah/yq)
-  jq    Required only for --json output (https://github.com/jqlang/jq)
+  jq    Required for --json and --pr-overwatch (https://github.com/jqlang/jq)
+  gh    Required for --pr-overwatch (https://cli.github.com)
 EOF
 }
 
@@ -191,6 +212,11 @@ parse_args() {
         RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' RESET=''
         shift
         ;;
+      --pr-overwatch)
+        ARG_PR_URL="${2:-}"
+        [[ -z "$ARG_PR_URL" ]] && { echo "Error: --pr-overwatch requires a GitHub PR URL" >&2; exit 1; }
+        shift 2
+        ;;
       --diag-dir)
         ARG_DIAG_DIR="${2:-}"
         [[ -z "$ARG_DIAG_DIR" ]] && { echo "Error: --diag-dir requires a path" >&2; exit 1; }
@@ -225,8 +251,12 @@ parse_args() {
     echo "Error: --watch cannot be combined with --json" >&2
     exit 1
   fi
-  if [[ "$ARG_TIMEOUT" -gt 0 && "$ARG_WAIT" != true ]]; then
-    echo "Error: --timeout requires --wait" >&2
+  if [[ -n "$ARG_PR_URL" && ("$ARG_WATCH" == true || "$ARG_WAIT" == true) ]]; then
+    echo "Error: --pr-overwatch cannot be combined with --watch or --wait" >&2
+    exit 1
+  fi
+  if [[ "$ARG_TIMEOUT" -gt 0 && "$ARG_WAIT" != true && -z "$ARG_PR_URL" ]]; then
+    echo "Error: --timeout requires --wait or --pr-overwatch" >&2
     exit 1
   fi
 }
@@ -455,6 +485,34 @@ diag_pac_controller() {
   diag_cmd "All PaC deployments" \
     run_oc_capture get deployments -n openshift-pipelines -l app.kubernetes.io/part-of=pipelines-as-code \
       -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image' \
+      --no-headers
+}
+
+diag_component_health() {
+  local cluster="${1:-current}"
+  init_diag_log
+  diag_section "Component health: one or more workloads unhealthy — ${cluster}"
+
+  diag_cmd "All deployments in openshift-pipelines" \
+    run_oc_capture get deployments -n openshift-pipelines \
+      -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas,AVAILABLE:.status.availableReplicas,UP-TO-DATE:.status.updatedReplicas' \
+      --no-headers
+
+  diag_cmd "All statefulsets in openshift-pipelines" \
+    run_oc_capture get statefulsets -n openshift-pipelines \
+      -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas' \
+      --no-headers
+
+  diag_cmd "Pods not in Running/Succeeded phase" \
+    run_oc_capture get pods -n openshift-pipelines \
+      --field-selector='status.phase!=Running,status.phase!=Succeeded' \
+      -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName,RESTARTS:.status.containerStatuses[0].restartCount' \
+      --no-headers
+
+  diag_cmd "Recent warning events in openshift-pipelines" \
+    run_oc_capture get events -n openshift-pipelines --field-selector type=Warning \
+      --sort-by=.lastTimestamp \
+      -o custom-columns='TIME:.lastTimestamp,OBJECT:.involvedObject.name,REASON:.reason,MSG:.message' \
       --no-headers
 }
 
@@ -752,6 +810,131 @@ check_pac_controller() {
   return 0
 }
 
+# ── Per-Component Deployment/StatefulSet Health ────────────────────────────
+# Verifies every expected pipeline-service workload is running and ready.
+# Uses only 2 oc calls (bulk-list deployments + statefulsets) then checks
+# each component locally.  PaC deployments are discovered by prefix so
+# renamed deployments across versions are picked up automatically.
+
+# Fixed-name deployments expected in openshift-pipelines.
+# tekton-events-controller is excluded — it has its own dedicated check
+# that handles the "scaled to 0" case.
+EXPECTED_DEPLOYMENTS=(
+  pipeline-metrics-exporter
+  pipelines-console-plugin
+  tekton-chains-controller
+  tekton-operator-proxy-webhook
+  tekton-pipelines-webhook
+  tekton-triggers-controller
+  tekton-triggers-core-interceptors
+  tekton-triggers-webhook
+  tkn-cli-serve
+)
+
+EXPECTED_STATEFULSETS=(
+  tekton-pipelines-controller
+  tekton-pipelines-remote-resolvers
+)
+
+check_component_health() {
+  local cluster="${1:-}"
+  local checked=0 healthy=0
+  local -a failures=()
+
+  # Bulk-fetch all deployments and statefulsets (2 oc calls total)
+  local deploy_raw sts_raw
+  if ! deploy_raw=$(run_oc get deployments -n openshift-pipelines \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.readyReplicas}{"|"}{.spec.replicas}{"\n"}{end}' 2>&1); then
+    fail "Component health: unable to list deployments"
+    diag_component_health "$cluster"
+    return 1
+  fi
+  sts_raw=$(run_oc get statefulsets -n openshift-pipelines \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.readyReplicas}{"|"}{.spec.replicas}{"\n"}{end}' 2>/dev/null || echo "")
+
+  # Build lookup maps: name → "readyReplicas|replicas"
+  local -A deploy_map=() sts_map=()
+  local line name rest
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    name="${line%%|*}"; rest="${line#*|}"
+    deploy_map["$name"]="$rest"
+  done <<< "$deploy_raw"
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    name="${line%%|*}"; rest="${line#*|}"
+    sts_map["$name"]="$rest"
+  done <<< "$sts_raw"
+
+  # ── Fixed-name deployments ─────────────────────────────────────────────
+  local deploy ready replicas
+  for deploy in "${EXPECTED_DEPLOYMENTS[@]}"; do
+    checked=$((checked + 1))
+    if [[ -z "${deploy_map[$deploy]+_}" ]]; then
+      failures+=("${deploy}: not found")
+      continue
+    fi
+    IFS='|' read -r ready replicas <<< "${deploy_map[$deploy]}"
+    ready="${ready:-0}"; replicas="${replicas:-0}"
+    if [[ "$ready" == "$replicas" ]]; then
+      healthy=$((healthy + 1))
+    else
+      failures+=("${deploy}: ${ready}/${replicas} ready")
+    fi
+  done
+
+  # ── PaC deployments (prefix-discovered) ────────────────────────────────
+  local pac_found=false
+  for name in "${!deploy_map[@]}"; do
+    [[ "$name" != pipelines-as-code-* ]] && continue
+    pac_found=true
+    checked=$((checked + 1))
+    IFS='|' read -r ready replicas <<< "${deploy_map[$name]}"
+    ready="${ready:-0}"; replicas="${replicas:-0}"
+    if [[ "$ready" == "$replicas" ]]; then
+      healthy=$((healthy + 1))
+    else
+      failures+=("${name}: ${ready}/${replicas} ready")
+    fi
+  done
+  if [[ "$pac_found" == false ]]; then
+    checked=$((checked + 1))
+    failures+=("pipelines-as-code-*: no PaC deployments discovered")
+  fi
+
+  # ── StatefulSets ───────────────────────────────────────────────────────
+  local sts
+  for sts in "${EXPECTED_STATEFULSETS[@]}"; do
+    checked=$((checked + 1))
+    if [[ -z "${sts_map[$sts]+_}" ]]; then
+      failures+=("${sts} (sts): not found")
+      continue
+    fi
+    IFS='|' read -r ready replicas <<< "${sts_map[$sts]}"
+    ready="${ready:-0}"; replicas="${replicas:-0}"
+    if [[ "$ready" == "$replicas" ]]; then
+      healthy=$((healthy + 1))
+    else
+      failures+=("${sts} (sts): ${ready}/${replicas} ready")
+    fi
+  done
+
+  # ── Result ─────────────────────────────────────────────────────────────
+  if [[ ${#failures[@]} -eq 0 ]]; then
+    pass "Component health: ${GREEN}${healthy}/${checked} workloads ready${RESET}"
+    return 0
+  else
+    fail "Component health: ${RED}${healthy}/${checked} workloads ready${RESET}"
+    local f
+    for f in "${failures[@]}"; do
+      printf "    ${RED}✗${RESET} %s\n" "$f"
+    done
+    diag_component_health "$cluster"
+    return 1
+  fi
+}
+
 # ── Extended Checks (--verify only) ─────────────────────────────────────────
 check_pruner_cronjob() {
   local output
@@ -865,6 +1048,7 @@ run_checks() {
   check_pod_health "$cluster";      count_result $?
   check_events_controller;          count_result $?
   check_pac_controller "$cluster";  count_result $?
+  check_component_health "$cluster"; count_result $?
 
   if [[ "$ARG_VERIFY" == true ]]; then
     check_pruner_cronjob;           count_result $?
@@ -1231,6 +1415,132 @@ execute_checks() {
   return $overall_exit
 }
 
+# ── PR Overwatch ─────────────────────────────────────────────────────────────
+# Two-phase workflow:
+#   Phase 1 — poll a GitHub PR every 30s until it reaches MERGED (or CLOSED).
+#   Phase 2 — run health checks in --wait mode until all pass.
+# Designed to be started once and left running in the background.
+
+PR_POLL_INTERVAL=30  # seconds between GitHub API polls
+
+pr_overwatch() {
+  local pr_url="$ARG_PR_URL"
+
+  # ── Validate PR and fetch initial metadata ─────────────────────────────
+  local pr_json
+  if ! pr_json=$(gh pr view "$pr_url" --json number,title,state,mergedAt,headRefName 2>&1); then
+    echo "Error: unable to fetch PR: ${pr_url}" >&2
+    echo "$pr_json" >&2
+    return 1
+  fi
+
+  local pr_number pr_title pr_state pr_branch
+  pr_number=$(jq -r '.number' <<< "$pr_json")
+  pr_title=$(jq -r '.title' <<< "$pr_json")
+  pr_state=$(jq -r '.state' <<< "$pr_json")
+  pr_branch=$(jq -r '.headRefName' <<< "$pr_json")
+
+  header "━━━ PR Overwatch: #${pr_number} ━━━"
+  info "Title:  ${BOLD}${pr_title}${RESET}"
+  info "Branch: ${pr_branch}"
+  info "URL:    ${pr_url}"
+  info "State:  ${pr_state}"
+  echo ""
+
+  # ── Phase 1: Poll until merge ──────────────────────────────────────────
+  if [[ "$pr_state" == "MERGED" ]]; then
+    local merged_at
+    merged_at=$(jq -r '.mergedAt // "unknown"' <<< "$pr_json")
+    info "${GREEN}PR already merged at ${merged_at} — skipping to health checks${RESET}"
+
+  elif [[ "$pr_state" == "CLOSED" ]]; then
+    fail "PR #${pr_number} is closed without merging — nothing to watch"
+    return 1
+
+  else
+    info "Polling PR status every ${PR_POLL_INTERVAL}s until merge…"
+    info "${DIM}(tip: background with Ctrl-Z + bg, or rerun with nohup … &)${RESET}"
+    echo ""
+
+    local attempt=1
+    while true; do
+      if ! pr_json=$(gh pr view "$pr_url" --json state,mergedAt 2>&1); then
+        warn "Unable to reach GitHub API — will retry (${pr_json:0:80})"
+        sleep "$PR_POLL_INTERVAL"
+        attempt=$((attempt + 1))
+        continue
+      fi
+
+      pr_state=$(jq -r '.state' <<< "$pr_json")
+
+      if [[ "$pr_state" == "MERGED" ]]; then
+        local merged_at
+        merged_at=$(jq -r '.mergedAt // "now"' <<< "$pr_json")
+        echo ""
+        info "${GREEN}PR #${pr_number} merged at ${merged_at}${RESET}"
+        break
+
+      elif [[ "$pr_state" == "CLOSED" ]]; then
+        echo ""
+        fail "PR #${pr_number} was closed without merging"
+        return 1
+      fi
+
+      # Show CI check summary alongside PR state for situational awareness
+      local checks_summary=""
+      local checks_json
+      if checks_json=$(gh pr checks "$pr_url" --json name,state 2>/dev/null); then
+        local total_checks pass_checks fail_checks pend_checks
+        total_checks=$(jq 'length' <<< "$checks_json")
+        pass_checks=$(jq '[.[] | select(.state == "SUCCESS")] | length' <<< "$checks_json")
+        fail_checks=$(jq '[.[] | select(.state == "FAILURE")] | length' <<< "$checks_json")
+        pend_checks=$(jq '[.[] | select(.state == "PENDING")] | length' <<< "$checks_json")
+        checks_summary="  CI: ${pass_checks}✓ ${fail_checks}✗ ${pend_checks}⧖ / ${total_checks}"
+      fi
+
+      printf "${DIM}── pr-check %d (%s) — %s%s ──${RESET}\n" \
+        "$attempt" "$(date -Iseconds 2>/dev/null || date)" "$pr_state" "$checks_summary"
+
+      sleep "$PR_POLL_INTERVAL"
+      attempt=$((attempt + 1))
+    done
+  fi
+
+  # ── Phase 2: Post-merge health verification ────────────────────────────
+  echo ""
+  header "━━━ Post-Merge Health Verification: #${pr_number} ━━━"
+  info "Running health checks until all pass (interval=${ARG_INTERVAL}s${ARG_TIMEOUT:+, timeout=${ARG_TIMEOUT}s})"
+  echo ""
+
+  init_diag_log
+
+  local start=$SECONDS
+  local attempt=1
+  while true; do
+    printf "${DIM}── post-merge check %d (%s) ──${RESET}\n" \
+      "$attempt" "$(date -Iseconds 2>/dev/null || date)"
+
+    if execute_checks; then
+      echo ""
+      info "${GREEN}${BOLD}✓ PR #${pr_number} merged and all health checks passed${RESET}"
+      print_diag_link
+      return 0
+    fi
+
+    if [[ "$ARG_TIMEOUT" -gt 0 && $((SECONDS - start)) -ge "$ARG_TIMEOUT" ]]; then
+      echo ""
+      print_diag_link
+      fail "Timed out after ${ARG_TIMEOUT}s waiting for post-merge health checks"
+      return 1
+    fi
+
+    info "Retrying health checks in ${ARG_INTERVAL}s…"
+    sleep "$ARG_INTERVAL"
+    attempt=$((attempt + 1))
+    echo ""
+  done
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 main() {
   parse_args "$@"
@@ -1239,6 +1549,9 @@ main() {
   # Dependency check
   local required_cmds=(oc yq)
   [[ "$ARG_JSON" == true ]] && required_cmds+=(jq)
+  if [[ -n "$ARG_PR_URL" ]]; then
+    required_cmds+=(gh jq)
+  fi
   for cmd in "${required_cmds[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
       echo "Error: '$cmd' is required but not found in PATH" >&2
@@ -1248,6 +1561,11 @@ main() {
 
   resolve_targets
   init_diag_log
+
+  if [[ -n "$ARG_PR_URL" ]]; then
+    pr_overwatch
+    return $?
+  fi
 
   if [[ "$ARG_WATCH" == true ]]; then
     info "Watching every ${ARG_INTERVAL}s — Ctrl-C to stop"
