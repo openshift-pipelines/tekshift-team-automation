@@ -44,6 +44,12 @@ ARG_WATCH=false
 ARG_WAIT=false
 ARG_INTERVAL=5      # seconds between --watch / --wait iterations
 ARG_TIMEOUT=0       # --wait only: 0 = no timeout, else max seconds to wait
+ARG_DIAG_DIR=""     # custom directory for diagnostic logs
+
+# ── Diagnostic Log State ──────────────────────────────────────────────────
+DIAG_LOG=""                                     # path to current session log
+DIAG_LOG_DIR="${TMPDIR:-/tmp}/ring-status-diag" # default log directory
+DIAG_HAS_ENTRIES=false                          # true once any diag is written
 
 # Per-target context used by run_oc during multi-cluster iteration.
 # Set before each cluster's checks; takes precedence over ARG_CONTEXT.
@@ -71,6 +77,7 @@ Options:
   --interval <sec>      Seconds between --watch/--wait iterations (default: 5)
   --timeout <sec>       Max seconds for --wait before failing (default: no limit)
   --json                Output results as JSON (implies no colors)
+  --diag-dir <path>     Directory for diagnostic logs (default: \$TMPDIR/ring-status-diag)
   --repo-path <path>    Path to infra-deployments repo (overrides auto-detect)
   --version             Show version information
   --help                Show this help message
@@ -87,6 +94,7 @@ Examples:
   $(basename "$0") --verify --watch         # refresh checks until Ctrl-C
   $(basename "$0") --wait --interval 10 --timeout 600
   $(basename "$0") --context admin-ctx      # use specific kubeconfig context
+  $(basename "$0") --wait --diag-dir ./logs # diagnostic logs written to ./logs/
 
 Multi-cluster context resolution:
   When --ring is used without --context, the script attempts to use each
@@ -106,6 +114,12 @@ Health checks performed:
   6. Pipelines as Code controller — image SHA
   7. tekton-resource-pruner CronJob — last job status  (--verify only)
   8. Marketplace pods health                            (--verify only)
+
+Diagnostic logging:
+  When any check fails, the script automatically captures detailed diagnostic
+  information (raw errors, alternative resource lookups, RBAC checks, namespace
+  scans) into a timestamped log file. The log path is printed after each failed
+  iteration so you can inspect root causes without re-running manually.
 
 Cross-cluster comparison (when checking multiple clusters):
   After individual checks, the script compares CatalogSource SHAs,
@@ -177,6 +191,11 @@ parse_args() {
         RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' RESET=''
         shift
         ;;
+      --diag-dir)
+        ARG_DIAG_DIR="${2:-}"
+        [[ -z "$ARG_DIAG_DIR" ]] && { echo "Error: --diag-dir requires a path" >&2; exit 1; }
+        shift 2
+        ;;
       --repo-path)
         ARG_REPO_PATH="${2:-}"
         [[ -z "$ARG_REPO_PATH" ]] && { echo "Error: --repo-path requires a path" >&2; exit 1; }
@@ -230,6 +249,213 @@ run_oc() {
     ctx_args=(--context "$ARG_CONTEXT")
   fi
   timeout "${OC_TIMEOUT}s" oc "${ctx_args[@]}" "$@" 2>/dev/null
+}
+
+# ── Diagnostic Log ────────────────────────────────────────────────────────
+# When a health check fails, these helpers capture detailed root-cause
+# information into a timestamped log file so operators can inspect the
+# "why" without manually re-running oc commands.
+
+init_diag_log() {
+  [[ -n "$DIAG_LOG" ]] && return
+  local dir="${ARG_DIAG_DIR:-$DIAG_LOG_DIR}"
+  mkdir -p "$dir" 2>/dev/null || { echo "Warning: cannot create diag dir: $dir" >&2; return; }
+  DIAG_LOG="${dir}/diag-$(date +%Y%m%dT%H%M%S)-$$.log"
+  : > "$DIAG_LOG"
+  DIAG_HAS_ENTRIES=false
+}
+
+diag() {
+  [[ -z "$DIAG_LOG" ]] && return
+  printf '%s\n' "$*" >> "$DIAG_LOG"
+  DIAG_HAS_ENTRIES=true
+}
+
+diag_section() {
+  [[ -z "$DIAG_LOG" ]] && return
+  printf '\n══ %s (%s) ══\n' "$1" "$(date -Iseconds 2>/dev/null || date)" >> "$DIAG_LOG"
+  DIAG_HAS_ENTRIES=true
+}
+
+# Run an oc command and log both stdout and stderr into the diagnostic log.
+diag_cmd() {
+  [[ -z "$DIAG_LOG" ]] && return
+  local label="$1"; shift
+  diag "  ── ${label}"
+  diag "  \$ $*"
+  local cmd_out
+  cmd_out=$("$@" 2>&1) || true
+  if [[ -n "$cmd_out" ]]; then
+    printf '%s\n' "$cmd_out" | sed 's/^/    /' >> "$DIAG_LOG"
+  else
+    diag "    (no output)"
+  fi
+}
+
+# Print the log path only if diagnostics were actually captured.
+print_diag_link() {
+  if [[ -n "$DIAG_LOG" && "$DIAG_HAS_ENTRIES" == true && -s "$DIAG_LOG" ]]; then
+    info "Diagnostic log: ${BOLD}${DIAG_LOG}${RESET}"
+  fi
+}
+
+# Like run_oc but preserves stderr for diagnostic capture.
+run_oc_capture() {
+  local ctx_args=()
+  if [[ -n "$CURRENT_TARGET_CTX" ]]; then
+    ctx_args=(--context "$CURRENT_TARGET_CTX")
+  elif [[ -n "$ARG_CONTEXT" ]]; then
+    ctx_args=(--context "$ARG_CONTEXT")
+  fi
+  timeout "${OC_TIMEOUT}s" oc "${ctx_args[@]}" "$@" 2>&1
+}
+
+# ── Per-Check Diagnostic Functions ───────────────────────────────────────
+# Called by each check_* function on failure to populate the diagnostic log
+# with actionable root-cause information.
+
+diag_subscription() {
+  local cluster="${1:-current}"
+  init_diag_log
+  diag_section "Subscription: unreachable or not found — ${cluster}"
+
+  diag "Expected: subscription/openshift-pipelines-operator in openshift-operators"
+  diag ""
+
+  # Capture the raw error (run_oc swallows stderr)
+  diag "  ── Raw error output"
+  diag "  \$ oc get subscription openshift-pipelines-operator -n openshift-operators"
+  local raw_err
+  raw_err=$(run_oc_capture get subscription openshift-pipelines-operator -n openshift-operators \
+    -o jsonpath='{.status.currentCSV}' 2>&1) || true
+  diag "    ${raw_err:-(empty)}"
+
+  # List all subscriptions across likely namespaces
+  local ns
+  for ns in openshift-operators openshift-pipelines tekton-pipelines; do
+    diag_cmd "All subscriptions in ${ns}" \
+      run_oc_capture get subscriptions.operators.coreos.com -n "$ns" \
+        -o custom-columns='NAME:.metadata.name,PACKAGE:.spec.name,CSV:.status.currentCSV' \
+        --no-headers
+  done
+
+  # Check if the Subscription CRD exists at all
+  diag_cmd "Subscription CRD check" \
+    run_oc_capture get crd subscriptions.operators.coreos.com -o name
+
+  # RBAC: can the current user even read subscriptions?
+  diag_cmd "RBAC: can-i get subscriptions in openshift-operators" \
+    run_oc_capture auth can-i get subscriptions.operators.coreos.com -n openshift-operators
+
+  # Check whether the operator is installed via a different mechanism
+  diag_cmd "ClusterServiceVersions matching 'pipeline'" \
+    run_oc_capture get csv -n openshift-operators -o custom-columns='NAME:.metadata.name,PHASE:.status.phase' \
+      --no-headers
+
+  # Check for operator pods directly (proves operator is running even without a subscription)
+  diag_cmd "Operator pods in openshift-pipelines" \
+    run_oc_capture get pods -n openshift-pipelines -o custom-columns='NAME:.metadata.name,STATUS:.status.phase' \
+      --no-headers
+
+  diag ""
+  diag "Likely root cause: the Subscription resource name or namespace differs"
+  diag "from the expected 'openshift-pipelines-operator' in 'openshift-operators'."
+  diag "On staging/dev clusters, operators are often installed via managed add-ons"
+  diag "or TektonConfig rather than OLM Subscriptions."
+}
+
+diag_catalog_source() {
+  local cluster="${1:-current}"
+  init_diag_log
+  diag_section "CatalogSource: unreachable or not found — ${cluster}"
+
+  diag "Expected: catalogsource/custom-operators in openshift-marketplace"
+  diag ""
+
+  diag_cmd "Raw error output" \
+    run_oc_capture get catalogsource custom-operators -n openshift-marketplace \
+      -o jsonpath='{.spec.image}{"|"}{.status.connectionState.lastObservedState}'
+
+  diag_cmd "All CatalogSources in openshift-marketplace" \
+    run_oc_capture get catalogsource -n openshift-marketplace \
+      -o custom-columns='NAME:.metadata.name,STATE:.status.connectionState.lastObservedState' \
+      --no-headers
+
+  diag_cmd "openshift-marketplace namespace exists" \
+    run_oc_capture get namespace openshift-marketplace -o name
+
+  diag_cmd "RBAC: can-i get catalogsources" \
+    run_oc_capture auth can-i get catalogsources.operators.coreos.com -n openshift-marketplace
+}
+
+diag_tekton_config() {
+  local cluster="${1:-current}"
+  init_diag_log
+  diag_section "TektonConfig: unreachable or not found — ${cluster}"
+
+  diag "Expected: tektonconfig/config"
+  diag ""
+
+  diag_cmd "Raw error output" \
+    run_oc_capture get tektonconfig config -o yaml
+
+  diag_cmd "All TektonConfig resources" \
+    run_oc_capture get tektonconfig -o custom-columns='NAME:.metadata.name' --no-headers
+
+  diag_cmd "TektonConfig CRD check" \
+    run_oc_capture get crd tektonconfigs.operator.tekton.dev -o name
+}
+
+diag_pod_health() {
+  local cluster="${1:-current}"
+  init_diag_log
+  diag_section "Pod health: failure — ${cluster}"
+
+  diag_cmd "All pods in openshift-pipelines (wide)" \
+    run_oc_capture get pods -n openshift-pipelines -o wide
+
+  diag_cmd "Unhealthy pods details" \
+    run_oc_capture get pods -n openshift-pipelines \
+      --field-selector='status.phase!=Running,status.phase!=Succeeded' \
+      -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,REASON:.status.reason' \
+      --no-headers
+
+  diag_cmd "Recent events in openshift-pipelines" \
+    run_oc_capture get events -n openshift-pipelines --sort-by=.lastTimestamp \
+      -o custom-columns='TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MSG:.message' \
+      --no-headers
+}
+
+diag_events_controller() {
+  local cluster="${1:-current}"
+  init_diag_log
+  diag_section "tekton-events-controller: failure — ${cluster}"
+
+  diag_cmd "Deployment details" \
+    run_oc_capture get deployment tekton-events-controller -n openshift-pipelines -o yaml
+
+  diag_cmd "TektonConfig events-controller spec" \
+    run_oc_capture get tektonconfig config \
+      -o jsonpath='{.spec.pipeline.options.deployments.tekton-events-controller}'
+
+  diag_cmd "All deployments in openshift-pipelines" \
+    run_oc_capture get deployments -n openshift-pipelines \
+      -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.status.replicas' \
+      --no-headers
+}
+
+diag_pac_controller() {
+  local cluster="${1:-current}"
+  init_diag_log
+  diag_section "PaC controller: failure — ${cluster}"
+
+  diag_cmd "Deployment details" \
+    run_oc_capture get deployment pipelines-as-code-controller -n openshift-pipelines -o yaml
+
+  diag_cmd "All PaC deployments" \
+    run_oc_capture get deployments -n openshift-pipelines -l app.kubernetes.io/part-of=pipelines-as-code \
+      -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image' \
+      --no-headers
 }
 
 # ── Ring/Cluster Resolution ─────────────────────────────────────────────────
@@ -356,6 +582,7 @@ check_catalog_source() {
   if ! output=$(run_oc get catalogsource custom-operators -n openshift-marketplace \
     -o jsonpath='{.spec.image}{"|"}{.status.connectionState.lastObservedState}' 2>&1); then
     fail "CatalogSource: unreachable or not found"
+    diag_catalog_source "$cluster"
     return 1
   fi
 
@@ -380,6 +607,7 @@ check_tekton_config() {
   if ! output=$(run_oc get tektonconfig config \
     -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{"|"}{.reason}{"|"}{.message}{end}' 2>&1); then
     fail "TektonConfig: unreachable or not found"
+    diag_tekton_config
     return 1
   fi
 
@@ -407,6 +635,7 @@ check_subscription() {
   if ! output=$(run_oc get subscription openshift-pipelines-operator -n openshift-operators \
     -o jsonpath='{.status.currentCSV}' 2>&1); then
     fail "Subscription: unreachable or not found"
+    diag_subscription "$cluster"
     return 1
   fi
 
@@ -422,10 +651,12 @@ check_subscription() {
 }
 
 check_pod_health() {
+  local cluster="${1:-}"
   local output
   if ! output=$(run_oc get pods -n openshift-pipelines \
     -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>&1); then
     fail "Pod health: unable to list pods in openshift-pipelines"
+    diag_pod_health "$cluster"
     return 1
   fi
 
@@ -440,12 +671,14 @@ check_pod_health() {
 
   if [[ $total -eq 0 ]]; then
     fail "Pod health: no pods found in openshift-pipelines"
+    diag_pod_health "$cluster"
     return 1
   elif [[ $unhealthy -eq 0 ]]; then
     pass "Pod health: ${GREEN}${total}/${total} healthy${RESET}"
     return 0
   else
     fail "Pod health: ${RED}${unhealthy}/${total} unhealthy${RESET}"
+    diag_pod_health "$cluster"
     return 1
   fi
 }
@@ -465,6 +698,7 @@ check_events_controller() {
     fi
 
     fail "tekton-events-controller: deployment not found"
+    diag_events_controller
     return 1
   fi
 
@@ -482,6 +716,7 @@ check_events_controller() {
     return 0
   else
     fail "tekton-events-controller: ${RED}${ready:-0}/${replicas} ready${RESET}  mem_limit=${mem_limit:-N/A}"
+    diag_events_controller
     return 1
   fi
 }
@@ -492,6 +727,7 @@ check_pac_controller() {
   if ! output=$(run_oc get deployment pipelines-as-code-controller -n openshift-pipelines \
     -o jsonpath='{.spec.template.spec.containers[0].image}' 2>&1); then
     fail "PaC controller: deployment not found"
+    diag_pac_controller "$cluster"
     return 1
   fi
 
@@ -626,7 +862,7 @@ run_checks() {
   check_catalog_source "$cluster";  count_result $?
   check_tekton_config;              count_result $?
   check_subscription "$cluster";    count_result $?
-  check_pod_health;                 count_result $?
+  check_pod_health "$cluster";      count_result $?
   check_events_controller;          count_result $?
   check_pac_controller "$cluster";  count_result $?
 
@@ -843,12 +1079,16 @@ check_connectivity() {
 }
 
 # Clear per-run state so --watch / --wait iterations don't leak prior results.
+# The diagnostic log file persists across iterations; only the per-iteration
+# "has entries" flag is reset so print_diag_link only fires when new diags
+# are written during the current iteration.
 reset_run_state() {
   OBSERVED_CSV=()
   OBSERVED_CATSRC_SHA=()
   OBSERVED_PAC_SHA=()
   SUMMARY_DATA=()
   JSON_RESULTS=()
+  DIAG_HAS_ENTRIES=false
 }
 
 # Run one full pass over TARGETS. Prints results; returns 0 if all checks passed.
@@ -984,6 +1224,7 @@ execute_checks() {
       info "${GREEN}All checks passed across ${cluster_count} cluster(s)${RESET}"
     else
       info "${RED}Some checks failed — review output above${RESET}"
+      print_diag_link
     fi
   fi
 
@@ -1006,6 +1247,7 @@ main() {
   done
 
   resolve_targets
+  init_diag_log
 
   if [[ "$ARG_WATCH" == true ]]; then
     info "Watching every ${ARG_INTERVAL}s — Ctrl-C to stop"
@@ -1029,6 +1271,7 @@ main() {
       fi
 
       if [[ "$ARG_TIMEOUT" -gt 0 && $((SECONDS - start)) -ge "$ARG_TIMEOUT" ]]; then
+        print_diag_link
         echo "Error: timed out after ${ARG_TIMEOUT}s waiting for checks to pass" >&2
         return 1
       fi
